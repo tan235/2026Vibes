@@ -1,496 +1,498 @@
 //+------------------------------------------------------------------+
-//|                                   2026 Trading Bot.mq5           |
-//|                                      Manna Mindset Tools         |
+//|                                           2026 Trading Bot.mq5   |
+//|                                            Manna Mindset Tools   |
 //+------------------------------------------------------------------+
 #property copyright "Manna Mindset"
-#property version   "1.00"
+#property version   "8.00"
 #property strict
 
-// INCLUDE TRADING LIBRARY
 #include <Trade/Trade.mqh>
 
 //==================================================================
-//                        INPUT SETTINGS
+//                           INPUT SETTINGS
 //==================================================================
 
-//--- 1. TRADING SETTINGS
 input group "--- TRADING STRATEGY ---"
-input bool   EnableTrading = true;       // Enable Auto-Trading?
-input double RiskPercent   = 1.0;        // Base Risk % (Resets to this after a win)
-input int    StopLossPts   = 200;        // Stop Loss in Points
-input int    TakeProfitPts = 400;        // Take Profit in Points
-input int    Slippage      = 3;          // Max Slippage allowed
+input bool   InpEnableTrading = true;        // Enable Auto-Trading?
+input double InpRiskPercent   = 1.0;         // Risk % per trade
+input int    InpMaxPositions  = 3;           // Max Stacked Positions
+input int    InpCooldownMinutes = 30;        // Wait time between stacked trades
+input int    InpSlippage      = 3;           // Max Slippage
 
-//--- 2. PIVOT POINT SETTINGS
+input group "--- TIME MANAGEMENT ---"
+input bool   InpCloseAtDayEnd = true;        // Close trades at end of day?
+input int    InpCloseHour     = 23;          // Hour to close (Server Time)
+input int    InpCloseMinute   = 50;          // Minute to close
+
+input group "--- RSI DIVERGENCE SETTINGS ---"
+input int    InpRSI_Period    = 14;          // RSI Period
+input int    InpDivLookback   = 30;          // Bars to scan for divergence
+input int    InpSwingSize     = 2;           // Bars to define a Peak/Valley
+
 input group "--- PIVOT SETTINGS ---"
-input color ColorPP = clrWhite;      // Pivot Point Color
-input color ColorR  = clrLimeGreen;  // Resistance Color
-input color ColorS  = clrTomato;     // Support Color
+input color  InpColorPP       = clrWhite;    // Pivot Point Color
+input color  InpColorRes      = clrLimeGreen;// Resistance Color
+input color  InpColorSup      = clrTomato;   // Support Color
 
-//--- 3. FILTER VISUALS
-input group "--- FILTER VISUALS ---"
-input bool  ShowDaily200 = true;
-input bool  ShowMA50     = true;
-input bool  ShowMA100    = true;
-input bool  ShowMA200    = true;
-input bool  ShowVWAP     = true;
-
-//--- 4. CHART & BRANDING
-input group "--- CHART & BRANDING ---"
-input bool   CleanOnLoad = true;
-input color  ClrBack     = clrBlack;
-input color  ClrCandleUp = clrLimeGreen;
-input color  ClrCandleDn = clrTomato;
-input bool   ShowBranding= true;
+input group "--- VISUALS ---"
+input bool   InpShowBranding  = true;        // Show Dashboard
+input color  InpClrBack       = clrBlack;
+input color  InpClrBull       = clrLimeGreen;
+input color  InpClrBear       = clrTomato;
 
 //==================================================================
-//                        GLOBAL VARIABLES
+//                           GLOBALS
 //==================================================================
 CTrade   trade;
-int      handleMaDaily;
-int      handleMa50, handleMa100, handleMa200;
-datetime lastBarTime = 0;
-datetime lastDayTime = 0;
-int      MAGIC_NUM = 888; // Defines which trades belong to this EA
+int      magicNum = 888;
+int      hRSI; // Daily MA handle removed
+
+struct SMarketData {
+   double bid, ask;
+   double vwap;
+   double rsi;
+   double r1, s1, pp;
+
+   bool   divBull, divBear;
+   bool   buySignal, sellSignal;
+   string failReason;
+};
+
+// Forward declaration of classes (Standard C++ / MQL5 practice)
+// However, since MQL5 requires definitions for instantiation, we will move the class definitions ABOVE OnInit.
+
+//==================================================================
+// CLASS DEFINITIONS (Moved up for visibility)
+//==================================================================
+
+//==================================================================
+// CLASS: RISK MANAGEMENT
+//==================================================================
+class CRiskManager;
+CRiskManager *Risk; // Global declaration here so it's visible to subsequent classes
+
+class CRiskManager
+{
+public:
+   double CalculateDynamicLots(double entryPrice, double slPrice)
+   {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      int losses     = GetConsecutiveLosses();
+
+      double riskFactor = MathPow(2, losses);
+      double adjRisk    = InpRiskPercent / riskFactor;
+      double riskMoney  = balance * (adjRisk / 100.0);
+
+      double slDist = MathAbs(entryPrice - slPrice);
+      if(slDist == 0) return 0.01;
+
+      double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tickVal == 0 || tickSize == 0) return 0.01;
+
+      double rawLots = riskMoney / ( (slDist / tickSize) * tickVal );
+
+      double step    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      double lots    = MathFloor(rawLots / step) * step;
+      double min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double max = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+      if(lots < min) lots = min;
+      if(lots > max) lots = max;
+
+      return lots;
+   }
+
+   int GetConsecutiveLosses()
+   {
+      if(!HistorySelect(0, TimeCurrent())) return 0;
+      int total = HistoryDealsTotal();
+      int losses = 0;
+      for(int i = total - 1; i >= 0; i--) {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != magicNum) continue;
+         if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+         if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+         double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         if(profit < 0) losses++;
+         else if(profit > 0) break;
+      }
+      return losses;
+   }
+};
+
+//==================================================================
+// CLASS: STRATEGY LOGIC
+//==================================================================
+class CStrategy
+{
+private:
+   double      m_buffRSI[];
+   double      m_low[], m_high[];
+   SMarketData m_data;
+   datetime    m_lastTradeTime;
+
+public:
+   CStrategy() { m_lastTradeTime = 0; }
+
+   void RunLogic()
+   {
+      if(!RefreshData()) return;
+      CalculateIndicators();
+      CheckDivergence();
+
+      m_data.buySignal = false;
+      m_data.sellSignal = false;
+      m_data.failReason = "Scanning...";
+
+      // --- BUY LOGIC ---
+      // 1. Price > VWAP
+      // 2. Price inside Pivot-R1 Zone
+      // 3. Bullish Divergence
+      bool buyTrend  = (m_data.bid > m_data.vwap);
+      bool buyZone   = (m_data.bid > m_data.pp && m_data.bid < m_data.r1);
+      bool buyDiv    = m_data.divBull;
+
+      if(buyTrend && buyZone && buyDiv) {
+         m_data.buySignal = true;
+         m_data.failReason = "BUY SIGNAL VALID";
+      }
+      else if(buyDiv) {
+         if(!buyTrend) m_data.failReason = "Bull Div ignored: Below VWAP";
+         if(!buyZone)  m_data.failReason = "Bull Div ignored: Bad Zone (Not >PP & <R1)";
+      }
+
+      // --- SELL LOGIC ---
+      // 1. Price < VWAP
+      // 2. Price inside Pivot-S1 Zone
+      // 3. Bearish Divergence
+      bool sellTrend = (m_data.bid < m_data.vwap);
+      bool sellZone  = (m_data.bid < m_data.pp && m_data.bid > m_data.s1);
+      bool sellDiv   = m_data.divBear;
+
+      if(sellTrend && sellZone && sellDiv) {
+         m_data.sellSignal = true;
+         m_data.failReason = "SELL SIGNAL VALID";
+      }
+      else if(sellDiv) {
+         if(!sellTrend) m_data.failReason = "Bear Div ignored: Above VWAP";
+         if(!sellZone)  m_data.failReason = "Bear Div ignored: Bad Zone (Not <PP & >S1)";
+      }
+
+      // EXECUTION CHECK
+      MqlDateTime dt; TimeCurrent(dt);
+      bool isEndOfDay = (InpCloseAtDayEnd && dt.hour >= InpCloseHour && dt.min >= InpCloseMinute);
+
+      bool onCooldown = (TimeCurrent() - m_lastTradeTime) < (InpCooldownMinutes * 60);
+      if(onCooldown) m_data.failReason = "Cooldown Active (" + IntegerToString(InpCooldownMinutes) + "m)";
+
+      if(InpEnableTrading && !isEndOfDay && !onCooldown && PositionsTotal() < InpMaxPositions)
+      {
+         ExecuteTrade();
+      }
+   }
+
+   void ExecuteTrade()
+   {
+      double slPrice = 0, tpPrice = 0, entryPrice = 0, lots = 0;
+
+      if(m_data.buySignal)
+      {
+         entryPrice = m_data.ask;
+         slPrice    = m_data.pp;
+         tpPrice    = m_data.r1;
+
+         if(slPrice >= entryPrice || tpPrice <= entryPrice) return;
+
+         // Needs access to Risk global pointer
+         if(CheckPointer(Risk) == POINTER_DYNAMIC) {
+             lots = Risk->CalculateDynamicLots(entryPrice, slPrice);
+             if(trade.Buy(lots, _Symbol, entryPrice, slPrice, tpPrice, "Div Buy"))
+                m_lastTradeTime = TimeCurrent();
+         }
+      }
+      else if(m_data.sellSignal)
+      {
+         entryPrice = m_data.bid;
+         slPrice    = m_data.pp;
+         tpPrice    = m_data.s1;
+
+         if(slPrice <= entryPrice || tpPrice >= entryPrice) return;
+
+         if(CheckPointer(Risk) == POINTER_DYNAMIC) {
+             lots = Risk->CalculateDynamicLots(entryPrice, slPrice);
+             if(trade.Sell(lots, _Symbol, entryPrice, slPrice, tpPrice, "Div Sell"))
+                m_lastTradeTime = TimeCurrent();
+         }
+      }
+   }
+
+   // --- INDICATOR CALCULATIONS ---
+   void CalculateIndicators() {
+      m_data.bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      m_data.ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      double h = iHigh(_Symbol, PERIOD_D1, 1);
+      double l = iLow(_Symbol, PERIOD_D1, 1);
+      double c = iClose(_Symbol, PERIOD_D1, 1);
+      m_data.pp = (h + l + c) / 3.0;
+      m_data.r1 = 2 * m_data.pp - l;
+      m_data.s1 = 2 * m_data.pp - h;
+
+      m_data.rsi     = m_buffRSI[0];
+      m_data.vwap    = CalculateVWAP();
+   }
+
+   double CalculateVWAP() {
+      int startBar = iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_D1, 0));
+      int limit = startBar;
+      double cumPV = 0, cumVol = 0;
+      for(int i = limit; i >= 0; i--) {
+         double p = iClose(_Symbol, PERIOD_CURRENT, i);
+         double v = (double)iTickVolume(_Symbol, PERIOD_CURRENT, i);
+         cumPV  += p * v;
+         cumVol += v;
+      }
+      return (cumVol > 0) ? cumPV / cumVol : 0;
+   }
+
+   // --- DIVERGENCE ENGINE ---
+   void CheckDivergence()
+   {
+      m_data.divBull = false; m_data.divBear = false;
+      int trough1 = -1, trough2 = -1;
+      int peak1   = -1, peak2   = -1;
+
+      // Bullish
+      for(int i = 1; i < InpDivLookback; i++) {
+         if(IsSwingLow(i)) {
+            if(trough1 == -1) trough1 = i;
+            else if(trough2 == -1) { trough2 = i; break; }
+         }
+      }
+      if(trough1 != -1 && trough2 != -1) {
+         if(m_low[trough1] < m_low[trough2] && m_buffRSI[trough1] > m_buffRSI[trough2]) {
+            if(trough1 <= 5) m_data.divBull = true;
+         }
+      }
+
+      // Bearish
+      for(int i = 1; i < InpDivLookback; i++) {
+         if(IsSwingHigh(i)) {
+            if(peak1 == -1) peak1 = i;
+            else if(peak2 == -1) { peak2 = i; break; }
+         }
+      }
+      if(peak1 != -1 && peak2 != -1) {
+         if(m_high[peak1] > m_high[peak2] && m_buffRSI[peak1] < m_buffRSI[peak2]) {
+            if(peak1 <= 5) m_data.divBear = true;
+         }
+      }
+   }
+
+   bool IsSwingLow(int i) {
+      if(i < InpSwingSize || i > InpDivLookback - InpSwingSize) return false;
+      double val = m_low[i];
+      for(int k = 1; k <= InpSwingSize; k++) {
+         if(m_low[i-k] <= val || m_low[i+k] <= val) return false;
+      }
+      return true;
+   }
+
+   bool IsSwingHigh(int i) {
+      if(i < InpSwingSize || i > InpDivLookback - InpSwingSize) return false;
+      double val = m_high[i];
+      for(int k = 1; k <= InpSwingSize; k++) {
+         if(m_high[i-k] >= val || m_high[i+k] >= val) return false;
+      }
+      return true;
+   }
+
+   bool RefreshData() {
+      int count = InpDivLookback + 5;
+      if(CopyBuffer(hRSI, 0, 0, count, m_buffRSI) <= 0) return false;
+      if(CopyLow(_Symbol, PERIOD_CURRENT, 0, count, m_low) <= 0) return false;
+      if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, count, m_high) <= 0) return false;
+
+      ArraySetAsSeries(m_buffRSI, true);
+      ArraySetAsSeries(m_low, true); ArraySetAsSeries(m_high, true);
+      return true;
+   }
+
+   SMarketData GetData() { return m_data; }
+};
+
+//==================================================================
+// CLASS: VISUALS
+//==================================================================
+class CVisuals
+{
+public:
+   void SetupChartColors() {
+      ChartSetInteger(0, CHART_MODE, CHART_CANDLES);
+      ChartSetInteger(0, CHART_SHOW_GRID, false);
+      ChartSetInteger(0, CHART_COLOR_BACKGROUND, InpClrBack);
+      ChartSetInteger(0, CHART_COLOR_FOREGROUND, clrWhite);
+      ChartSetInteger(0, CHART_COLOR_CANDLE_BEAR, InpClrBear);
+      ChartSetInteger(0, CHART_COLOR_CHART_DOWN, InpClrBear);
+      ChartSetInteger(0, CHART_COLOR_CANDLE_BULL, InpClrBull);
+      ChartSetInteger(0, CHART_COLOR_CHART_UP, InpClrBull);
+      ChartRedraw(0);
+   }
+
+   void DrawPivots() {
+      ObjectsDeleteAll(0, "DGT");
+      double h = iHigh(_Symbol, PERIOD_D1, 1);
+      double l = iLow(_Symbol, PERIOD_D1, 1);
+      double c = iClose(_Symbol, PERIOD_D1, 1);
+      double pp=(h+l+c)/3.0;
+      CreatePivotLine("PP", pp, InpColorPP, 2);
+      CreatePivotLine("R1", 2*pp-l, InpColorRes, 1);
+      CreatePivotLine("S1", 2*pp-h, InpColorSup, 1);
+   }
+
+   void CreatePivotLine(string name, double price, color col, int width) {
+      datetime t1=iTime(_Symbol, PERIOD_D1, 0);
+      datetime t2=t1+PeriodSeconds(PERIOD_D1);
+      string n="DGT "+name;
+      if(ObjectFind(0, n)<0) ObjectCreate(0, n, OBJ_TREND, 0, t1, price, t2, price);
+      else {
+         ObjectSetDouble(0, n, OBJPROP_PRICE, 0, price); ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1);
+         ObjectSetDouble(0, n, OBJPROP_PRICE, 1, price); ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2);
+      }
+      ObjectSetInteger(0, n, OBJPROP_COLOR, col);
+      ObjectSetInteger(0, n, OBJPROP_WIDTH, width);
+      ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
+      ObjectSetString(0, n, OBJPROP_TEXT, "  "+name);
+   }
+
+   void DrawBranding() {
+      string objName = "MannaBrandLogo";
+      if(ObjectFind(0, objName) < 0) ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
+      ObjectSetString(0, objName, OBJPROP_TEXT, "MANNA MINDSET");
+      ObjectSetString(0, objName, OBJPROP_FONT, "Impact");
+      ObjectSetInteger(0, objName, OBJPROP_FONTSIZE, 18);
+      ObjectSetInteger(0, objName, OBJPROP_COLOR, clrGold);
+      ObjectSetInteger(0, objName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, 20);
+      ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, 350);
+   }
+
+   // FIX: Changed SMarketData &d to SMarketData d (pass by value)
+   // This allows passing the temporary return value from Strategy->GetData()
+   void UpdateDashboard(SMarketData d) {
+      int losses = 0;
+      if(CheckPointer(Risk) == POINTER_DYNAMIC) {
+         losses = Risk->GetConsecutiveLosses();
+      }
+
+      string text = "================================\n";
+      text += "   2026 TRADING BOT (v8.0)       \n";
+      text += "================================\n";
+      text += "STATUS: " + d.failReason + "\n\n";
+
+      text += "--- ACTIVE SETTINGS ------------\n";
+      text += "Positions: " + IntegerToString(PositionsTotal()) + " / " + IntegerToString(3) + "\n";
+      text += "Closes at: " + IntegerToString(23) + ":50\n\n";
+
+      text += "--- MARKET FILTERS -------------\n";
+      text += "VWAP:        " + ((d.bid > d.vwap) ? "Bullish" : "Bearish") + "\n";
+      text += "Pivot Zone:  " + ((d.bid > d.pp && d.bid < d.r1) ? "BUY Zone" : ((d.bid < d.pp && d.bid > d.s1) ? "SELL Zone" : "Neutral")) + "\n";
+
+      text += "--- RSI DIVERGENCE -------------\n";
+      text += "Signal:      " + (d.divBull ? "BULL" : (d.divBear ? "BEAR" : "None")) + "\n\n";
+
+      text += "--- RISK MANAGEMENT ------------\n";
+      text += "Loss Streak: " + IntegerToString(losses) + "\n";
+
+      Comment(text);
+   }
+};
+
+CVisuals     *Graphics;
+CStrategy    *Strategy;
 
 //+------------------------------------------------------------------+
 //| Expert Initialization Function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   handleMaDaily = iMA(_Symbol, PERIOD_D1, 200, 0, MODE_SMA, PRICE_CLOSE);
-   handleMa50    = iMA(_Symbol, PERIOD_CURRENT, 50, 0, MODE_SMA, PRICE_CLOSE);
-   handleMa100   = iMA(_Symbol, PERIOD_CURRENT, 100, 0, MODE_SMA, PRICE_CLOSE);
-   handleMa200   = iMA(_Symbol, PERIOD_CURRENT, 200, 0, MODE_SMA, PRICE_CLOSE);
+   hRSI = iRSI(_Symbol, PERIOD_CURRENT, InpRSI_Period, PRICE_CLOSE);
+   if(hRSI == INVALID_HANDLE) return(INIT_FAILED);
 
-   trade.SetExpertMagicNumber(MAGIC_NUM);
-   trade.SetDeviationInPoints(Slippage);
+   trade.SetExpertMagicNumber(magicNum);
+   trade.SetDeviationInPoints(InpSlippage);
 
-   if(CleanOnLoad) SetupChart();
-   DrawPivots();
-   if(ShowBranding) DrawBrandingLabel();
+   Risk     = new CRiskManager();
+   Graphics = new CVisuals();
+   Strategy = new CStrategy();
+
+   Graphics->SetupChartColors();
+   Graphics->DrawPivots();
+   if(InpShowBranding) Graphics->DrawBranding();
 
    return(INIT_SUCCEEDED);
 }
 
-//+------------------------------------------------------------------+
-//| Expert Deinitialization Function                                 |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   if(CheckPointer(Risk) == POINTER_DYNAMIC) delete Risk;
+   if(CheckPointer(Graphics) == POINTER_DYNAMIC) delete Graphics;
+   if(CheckPointer(Strategy) == POINTER_DYNAMIC) delete Strategy;
    ObjectsDeleteAll(0, "DGT");
-   ObjectsDeleteAll(0, "FLT");
    ObjectDelete(0, "MannaBrandLogo");
    Comment("");
+   IndicatorRelease(hRSI);
 }
 
-//+------------------------------------------------------------------+
-//| Expert Tick Function                                             |
-//+------------------------------------------------------------------+
 void OnTick()
 {
+   static datetime lastDayTime = 0;
    datetime currentDay = iTime(_Symbol, PERIOD_D1, 0);
-   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
-   bool newBar = (lastBarTime != currentBarTime);
 
-   // A. Visual Updates
-
-   // Daily updates (Pivots, Daily MA if needed per day)
-   if(lastDayTime != currentDay)
-   {
-      DrawPivots();
+   // 1. Redraw Pivots on New Day
+   if(lastDayTime != currentDay) {
+      Graphics->DrawPivots();
       lastDayTime = currentDay;
    }
 
-   // Intraday Visuals
-   // We update only on new bar to save resources, or current bar live?
-   // Strategy: Full redraw on new bar. Update index 0 on every tick.
-   // For simplicity and "Fixing" the heavy load, we will redraw only on new bar
-   // AND update the current forming bar (index 0) on every tick.
+   // 2. Check End of Day Closure
+   if(InpCloseAtDayEnd) CheckEndOfDay();
 
-   if(ShowDaily200) DrawDailyMA(); else ObjectsDeleteAll(0, "FLT_Daily200");
+   // 3. Run Strategy
+   Strategy->RunLogic();
 
-   if(ShowVWAP)     DrawVWAP(newBar);    else ObjectsDeleteAll(0, "FLT_VWAP_");
-   DrawChartMAs(newBar);
-
-   lastBarTime = currentBarTime;
-
-   // B. Run Trading Logic
-   ProcessTradingLogic();
+   // 4. Update Dashboard
+   if(InpShowBranding) Graphics->UpdateDashboard(Strategy->GetData());
 }
 
-//==================================================================
-//                     TRADING LOGIC ENGINE
-//==================================================================
-
-void ProcessTradingLogic()
+//+------------------------------------------------------------------+
+//| End of Day Logic                                                 |
+//+------------------------------------------------------------------+
+void CheckEndOfDay()
 {
-   double ma50[], ma100[], ma200[], maD1[];
+   MqlDateTime dt;
+   TimeCurrent(dt);
 
-   if(CopyBuffer(handleMa50, 0, 0, 1, ma50) <= 0) return;
-   if(CopyBuffer(handleMa100, 0, 0, 1, ma100) <= 0) return;
-   if(CopyBuffer(handleMa200, 0, 0, 1, ma200) <= 0) return;
-   if(CopyBuffer(handleMaDaily, 0, 0, 2, maD1) <= 0) return;
-   ArraySetAsSeries(maD1, true);
-
-   double highD1 = iHigh(_Symbol, PERIOD_D1, 1);
-   double lowD1 = iLow(_Symbol, PERIOD_D1, 1);
-   double closeD1 = iClose(_Symbol, PERIOD_D1, 1);
-   double pp = (highD1 + lowD1 + closeD1) / 3.0;
-   double r1 = 2 * pp - lowD1;
-   double s1 = 2 * pp - highD1;
-
-   double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double vwap = GetCurrentVWAP();
-   double dailyMAValue = maD1[0];
-
-   // Trend Definitions
-   bool stackBull = (ma50[0] > ma100[0] && ma100[0] > ma200[0]);
-   bool stackBear = (ma50[0] < ma100[0] && ma100[0] < ma200[0]);
-
-   bool isStrongBull = (stackBull && bid > ma50[0] && bid > dailyMAValue && bid > vwap && bid > pp);
-   bool isStrongBear = (stackBear && bid < ma50[0] && bid < dailyMAValue && bid < pp);
-
-   // Triggers
-   bool buySignal  = (isStrongBull && bid > r1);
-   bool sellSignal = (isStrongBear && bid < s1);
-
-   // --- EXECUTE TRADES ---
-   if(EnableTrading && PositionsTotal() == 0)
+   if(dt.hour == InpCloseHour && dt.min >= InpCloseMinute)
    {
-      // Get Loss Streak
-      int losses = GetConsecutiveLosses();
-      double currentLotSize = CalculateDefensiveLots(StopLossPts, losses);
-
-      if(buySignal)
-         trade.Buy(currentLotSize, _Symbol, ask, bid - StopLossPts*_Point, bid + TakeProfitPts*_Point, "Manna Bull");
-      else if(sellSignal)
-         trade.Sell(currentLotSize, _Symbol, bid, ask + StopLossPts*_Point, ask - TakeProfitPts*_Point, "Manna Bear");
+      if(PositionsTotal() > 0) {
+         CloseAllPositions();
+      }
    }
-
-   // Update Dashboard
-   UpdateDashboard(isStrongBull, isStrongBear, buySignal, sellSignal, r1, s1, pp, vwap, bid);
 }
 
-//+------------------------------------------------------------------+
-//| DEFENSIVE RISK: Halve risk on every consecutive loss             |
-//+------------------------------------------------------------------+
-double CalculateDefensiveLots(int slPoints, int consecutiveLosses)
+void CloseAllPositions()
 {
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-
-   // LOGIC: Divide Risk by 2 for every loss (Risk / 2^losses)
-   // Example: 1 Loss -> 1.0% / 2 = 0.5%
-   // Example: 2 Loss -> 1.0% / 4 = 0.25%
-   double riskFactor = MathPow(2, consecutiveLosses);
-   double adjustedRiskPercent = RiskPercent / riskFactor;
-
-   double riskMoney = balance * (adjustedRiskPercent / 100.0);
-
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   if(tickValue == 0) tickValue = 1.0;
-   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-   double rawLots = riskMoney / (slPoints * tickValue);
-   double lots    = MathFloor(rawLots / lotStep) * lotStep;
-
-   double minLots = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLots = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-
-   if(lots < minLots) lots = minLots; // Never go below min lots
-   if(lots > maxLots) lots = maxLots;
-
-   return lots;
-}
-
-//+------------------------------------------------------------------+
-//| HELPER: Count Consecutive Losses from History                    |
-//+------------------------------------------------------------------+
-int GetConsecutiveLosses()
-{
-   // Only select necessary history if possible, but we need to find the last win.
-   // Scanning all history is safe but slow.
-   if(!HistorySelect(0, TimeCurrent())) return 0;
-
-   int total = HistoryDealsTotal();
-   int losses = 0;
-
-   // Loop BACKWARDS from newest to oldest
-   for(int i = total - 1; i >= 0; i--)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      ulong ticket = HistoryDealGetTicket(i);
+      ulong ticket = PositionGetTicket(i);
       if(ticket > 0)
       {
-         // Check if deal matches this EA (Magic Number) and Symbol
-         long dealMagic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
-         string dealSymbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
-         long dealEntry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
-
-         if(dealMagic == MAGIC_NUM && dealSymbol == _Symbol && dealEntry == DEAL_ENTRY_OUT) // Entry Out = Close
+         if(PositionGetInteger(POSITION_MAGIC) == magicNum && PositionGetString(POSITION_SYMBOL) == _Symbol)
          {
-            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
-
-            if(profit < 0) losses++;       // Found a loss, add to streak
-            else if(profit > 0) break;     // Found a win, STOP counting (streak ended)
+            trade.PositionClose(ticket);
          }
       }
    }
-   return losses;
-}
-
-//==================================================================
-//                     HELPERS & DRAWINGS
-//==================================================================
-
-void UpdateDashboard(bool bull, bool bear, bool buy, bool sell, double r1, double s1, double pp, double vwap, double bid)
-{
-   int losses = GetConsecutiveLosses();
-   double currentRisk = RiskPercent / MathPow(2, losses);
-
-   string trendStatus = "--- WAITING ---";
-   if(bull) trendStatus = ">> BULLISH (Wait R1) <<";
-   if(bear) trendStatus = "<< BEARISH (Wait S1) >>";
-   if(buy)  trendStatus = "!!! BUY TRIGGER !!!";
-   if(sell) trendStatus = "!!! SELL TRIGGER !!!";
-
-   string text = "================================\n";
-   text += "   2026 TRADING BOT (v1.0)      \n";
-   text += "================================\n";
-   text += "STATUS: " + trendStatus + "\n";
-   text += "\n";
-   text += "--- RISK MANAGEMENT ------------\n";
-   text += "Consecutive Losses: " + IntegerToString(losses) + "\n";
-   text += "Current Risk:       " + DoubleToString(currentRisk, 2) + "%\n";
-   text += "\n";
-   text += "--- ENTRY TRIGGERS -------------\n";
-   text += "BUY Trigger (R1): " + DoubleToString(r1, _Digits) + "\n";
-   text += "SELL Trigger (S1): " + DoubleToString(s1, _Digits) + "\n";
-   text += "\n";
-   text += "--- CURRENT LEVELS -------------\n";
-   text += "Bid Price:   " + DoubleToString(bid, _Digits) + "\n";
-   text += "Daily VWAP:  " + DoubleToString(vwap, _Digits) + "\n";
-   text += "Pivot Point: " + DoubleToString(pp, _Digits) + "\n";
-
-   Comment(text);
-}
-
-void DrawBrandingLabel()
-{
-   string objName = "MannaBrandLogo";
-   if(ObjectFind(0, objName) < 0) ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
-   ObjectSetString(0, objName, OBJPROP_TEXT, "MANNA MINDSET");
-   ObjectSetString(0, objName, OBJPROP_FONT, "Impact");
-   ObjectSetInteger(0, objName, OBJPROP_FONTSIZE, 18);
-   ObjectSetInteger(0, objName, OBJPROP_COLOR, clrGold);
-   ObjectSetInteger(0, objName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, objName, OBJPROP_XDISTANCE, 20);
-   ObjectSetInteger(0, objName, OBJPROP_YDISTANCE, 350);
-   ChartRedraw(0);
-}
-
-double GetCurrentVWAP() {
-   int startBar = iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_D1, 0));
-   int limit = startBar;
-   double cumPV = 0, cumVol = 0;
-   double high[], low[], close[];
-   long vol[];
-
-   ArraySetAsSeries(high, true);
-   ArraySetAsSeries(low, true);
-   ArraySetAsSeries(close, true);
-   ArraySetAsSeries(vol, true);
-
-   if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, limit+1, high)<=0) return 0;
-   if(CopyLow(_Symbol, PERIOD_CURRENT, 0, limit+1, low)<=0) return 0;
-   if(CopyClose(_Symbol, PERIOD_CURRENT, 0, limit+1, close)<=0) return 0;
-   if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, limit+1, vol)<=0) return 0;
-
-   for(int i=limit; i>=0; i--) {
-      double tp=(high[i]+low[i]+close[i])/3.0;
-      double v=(double)vol[i];
-      cumPV+=tp*v;
-      cumVol+=v;
-   }
-   if(cumVol>0) return cumPV/cumVol;
-   return 0;
-}
-
-void DrawChartMAs(bool fullRedraw) {
-   if(ShowMA50) DrawSingleMA(handleMa50, 50, clrAqua, "MA50", fullRedraw); else ObjectsDeleteAll(0, "FLT_MA50_");
-   if(ShowMA100) DrawSingleMA(handleMa100, 100, clrOrange, "MA100", fullRedraw); else ObjectsDeleteAll(0, "FLT_MA100_");
-   if(ShowMA200) DrawSingleMA(handleMa200, 200, clrRed, "MA200", fullRedraw); else ObjectsDeleteAll(0, "FLT_MA200_");
-}
-
-void DrawSingleMA(int handle, int period, color col, string suffix, bool fullRedraw) {
-   int drawBars = 300;
-   double buff[];
-
-   // If not full redraw, we only need a few bars to update the head.
-   // But we still need correct indexing.
-   // Simplest robust way: always get data, but only loop 0 if not fullRedraw.
-
-   if(CopyBuffer(handle, 0, 0, drawBars+1, buff)<=0) return;
-   ArraySetAsSeries(buff, true);
-
-   int limit = fullRedraw ? drawBars : 1;
-   // Note: We always update index 0 (current bar).
-   // If fullRedraw=false, we only loop i=0.
-
-   for(int i=0; i<limit; i++) {
-      string n="FLT_"+suffix+"_"+IntegerToString(i);
-      datetime t1=iTime(_Symbol, PERIOD_CURRENT, i+1);
-      datetime t2=iTime(_Symbol, PERIOD_CURRENT, i);
-      double p1=buff[i+1];
-      double p2=buff[i];
-
-      if(p1==0||p2==0) continue;
-
-      if(ObjectFind(0, n)<0)
-         ObjectCreate(0, n, OBJ_TREND, 0, t1, p1, t2, p2);
-      else {
-         ObjectSetDouble(0, n, OBJPROP_PRICE, 0, p1);
-         ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1);
-         ObjectSetDouble(0, n, OBJPROP_PRICE, 1, p2);
-         ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2);
-      }
-      ObjectSetInteger(0, n, OBJPROP_COLOR, col);
-      ObjectSetInteger(0, n, OBJPROP_WIDTH, (period==200)?2:1);
-      ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
-      ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
-   }
-}
-
-void DrawVWAP(bool fullRedraw) {
-   int startBar=iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_D1, 0));
-   int limit=startBar;
-
-   double cumPV=0, cumVol=0, prevVwap=0;
-   datetime prevTime=0;
-   double high[], low[], close[];
-   long vol[];
-
-   ArraySetAsSeries(high, true);
-   ArraySetAsSeries(low, true);
-   ArraySetAsSeries(close, true);
-   ArraySetAsSeries(vol, true);
-
-   if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, limit+1, high)<=0) return;
-   if(CopyLow(_Symbol, PERIOD_CURRENT, 0, limit+1, low)<=0) return;
-   if(CopyClose(_Symbol, PERIOD_CURRENT, 0, limit+1, close)<=0) return;
-   if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, limit+1, vol)<=0) return;
-
-   // VWAP Calculation involves iteration from start of day.
-   // We cannot easily skip calculation, but we can skip drawing objects for old bars.
-
-   for(int i=limit; i>=0; i--) {
-      double tp=(high[i]+low[i]+close[i])/3.0;
-      double v=(double)vol[i];
-      cumPV+=tp*v;
-      cumVol+=v;
-      double vwap=(cumVol>0)?cumPV/cumVol:tp;
-      datetime t=iTime(_Symbol, PERIOD_CURRENT, i);
-
-      // Drawing
-      if(i<limit) {
-         // Optimization: Only draw if fullRedraw or if i==0 (current bar)
-         if(fullRedraw || i==0) {
-             string n="FLT_VWAP_"+IntegerToString(i);
-             if(ObjectFind(0, n)<0)
-                 ObjectCreate(0, n, OBJ_TREND, 0, prevTime, prevVwap, t, vwap);
-             else {
-                 ObjectSetDouble(0, n, OBJPROP_PRICE, 0, prevVwap);
-                 ObjectSetInteger(0, n, OBJPROP_TIME, 0, prevTime);
-                 ObjectSetDouble(0, n, OBJPROP_PRICE, 1, vwap);
-                 ObjectSetInteger(0, n, OBJPROP_TIME, 1, t);
-             }
-             ObjectSetInteger(0, n, OBJPROP_COLOR, clrHotPink);
-             ObjectSetInteger(0, n, OBJPROP_STYLE, STYLE_DASHDOT);
-             ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
-             ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
-         }
-      }
-      prevVwap=vwap;
-      prevTime=t;
-   }
-}
-
-void DrawDailyMA() {
-   double ma[];
-   if(CopyBuffer(handleMaDaily, 0, 0, 1, ma)<=0) return;
-   double p=ma[0];
-   datetime t1=iTime(_Symbol, PERIOD_D1, 0);
-   datetime t2=t1+PeriodSeconds(PERIOD_D1);
-   string n="FLT_Daily200";
-
-   if(ObjectFind(0, n)<0)
-      ObjectCreate(0, n, OBJ_TREND, 0, t1, p, t2, p);
-   else {
-      ObjectSetDouble(0, n, OBJPROP_PRICE, 0, p);
-      ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1);
-      ObjectSetDouble(0, n, OBJPROP_PRICE, 1, p);
-      ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2);
-   }
-   ObjectSetInteger(0, n, OBJPROP_COLOR, clrYellow);
-   ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
-   ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
-   ObjectSetString(0, n, OBJPROP_TEXT, " Daily 200 SMA");
-}
-
-void DrawPivots() {
-   ObjectsDeleteAll(0, "DGT");
-   double h=iHigh(_Symbol, PERIOD_D1, 1);
-   double l=iLow(_Symbol, PERIOD_D1, 1);
-   double c=iClose(_Symbol, PERIOD_D1, 1);
-
-   double pp=(h+l+c)/3.0;
-   double r1=2*pp-l;
-   double s1=2*pp-h;
-   double r2=pp+(h-l);
-   double s2=pp-(h-l);
-   double r3=h+2*(pp-l);
-   double s3=l-2*(h-pp);
-
-   CreateLine("PP", pp, ColorPP, 2);
-   CreateLine("R1", r1, ColorR, 1);
-   CreateLine("S1", s1, ColorS, 1);
-   CreateLine("R2", r2, ColorR, 1);
-   CreateLine("S2", s2, ColorS, 1);
-   CreateLine("R3", r3, ColorR, 1);
-   CreateLine("S3", s3, ColorS, 1);
-   ChartRedraw(0);
-}
-
-void CreateLine(string name, double price, color col, int width) {
-   datetime t1=iTime(_Symbol, PERIOD_D1, 0);
-   datetime t2=t1+PeriodSeconds(PERIOD_D1);
-   string n="DGT "+name;
-
-   if(ObjectFind(0, n)<0)
-      ObjectCreate(0, n, OBJ_TREND, 0, t1, price, t2, price);
-   else {
-      ObjectSetDouble(0, n, OBJPROP_PRICE, 0, price);
-      ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1);
-      ObjectSetDouble(0, n, OBJPROP_PRICE, 1, price);
-      ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2);
-   }
-   ObjectSetInteger(0, n, OBJPROP_COLOR, col);
-   ObjectSetInteger(0, n, OBJPROP_WIDTH, width);
-   ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
-   ObjectSetString(0, n, OBJPROP_TEXT, "  "+name);
-   ObjectSetInteger(0, n, OBJPROP_FONTSIZE, 8);
-   ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
-}
-
-void SetupChart() {
-   ChartSetInteger(0, CHART_MODE, CHART_CANDLES);
-   ChartSetInteger(0, CHART_SHOW_GRID, false);
-   ChartSetInteger(0, CHART_SHOW_PERIOD_SEP, false);
-   ChartSetInteger(0, CHART_COLOR_BACKGROUND, ClrBack);
-   ChartSetInteger(0, CHART_COLOR_FOREGROUND, clrWhite);
-   ChartSetInteger(0, CHART_COLOR_CANDLE_BEAR, ClrCandleDn);
-   ChartSetInteger(0, CHART_COLOR_CHART_DOWN, ClrCandleDn);
-   ChartSetInteger(0, CHART_COLOR_CANDLE_BULL, ClrCandleUp);
-   ChartSetInteger(0, CHART_COLOR_CHART_UP, ClrCandleUp);
-   ChartRedraw(0);
 }
