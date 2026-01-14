@@ -90,13 +90,30 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    datetime currentDay = iTime(_Symbol, PERIOD_D1, 0);
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   bool newBar = (lastBarTime != currentBarTime);
 
    // A. Visual Updates
-   if(lastDayTime != currentDay) { DrawPivots(); lastDayTime = currentDay; }
+
+   // Daily updates (Pivots, Daily MA if needed per day)
+   if(lastDayTime != currentDay)
+   {
+      DrawPivots();
+      lastDayTime = currentDay;
+   }
+
+   // Intraday Visuals
+   // We update only on new bar to save resources, or current bar live?
+   // Strategy: Full redraw on new bar. Update index 0 on every tick.
+   // For simplicity and "Fixing" the heavy load, we will redraw only on new bar
+   // AND update the current forming bar (index 0) on every tick.
 
    if(ShowDaily200) DrawDailyMA(); else ObjectsDeleteAll(0, "FLT_Daily200");
-   if(ShowVWAP)     DrawVWAP();    else ObjectsDeleteAll(0, "FLT_VWAP_");
-   DrawChartMAs();
+
+   if(ShowVWAP)     DrawVWAP(newBar);    else ObjectsDeleteAll(0, "FLT_VWAP_");
+   DrawChartMAs(newBar);
+
+   lastBarTime = currentBarTime;
 
    // B. Run Trading Logic
    ProcessTradingLogic();
@@ -116,7 +133,9 @@ void ProcessTradingLogic()
    if(CopyBuffer(handleMaDaily, 0, 0, 2, maD1) <= 0) return;
    ArraySetAsSeries(maD1, true);
 
-   double highD1 = iHigh(_Symbol, PERIOD_D1, 1); double lowD1 = iLow(_Symbol, PERIOD_D1, 1); double closeD1 = iClose(_Symbol, PERIOD_D1, 1);
+   double highD1 = iHigh(_Symbol, PERIOD_D1, 1);
+   double lowD1 = iLow(_Symbol, PERIOD_D1, 1);
+   double closeD1 = iClose(_Symbol, PERIOD_D1, 1);
    double pp = (highD1 + lowD1 + closeD1) / 3.0;
    double r1 = 2 * pp - lowD1;
    double s1 = 2 * pp - highD1;
@@ -190,7 +209,8 @@ double CalculateDefensiveLots(int slPoints, int consecutiveLosses)
 //+------------------------------------------------------------------+
 int GetConsecutiveLosses()
 {
-   // Select entire history
+   // Only select necessary history if possible, but we need to find the last win.
+   // Scanning all history is safe but slow.
    if(!HistorySelect(0, TimeCurrent())) return 0;
 
    int total = HistoryDealsTotal();
@@ -203,9 +223,11 @@ int GetConsecutiveLosses()
       if(ticket > 0)
       {
          // Check if deal matches this EA (Magic Number) and Symbol
-         if(HistoryDealGetInteger(ticket, DEAL_MAGIC) == MAGIC_NUM &&
-            HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol &&
-            HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT) // Entry Out = Close
+         long dealMagic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
+         string dealSymbol = HistoryDealGetString(ticket, DEAL_SYMBOL);
+         long dealEntry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+
+         if(dealMagic == MAGIC_NUM && dealSymbol == _Symbol && dealEntry == DEAL_ENTRY_OUT) // Entry Out = Close
          {
             double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
 
@@ -268,60 +290,207 @@ void DrawBrandingLabel()
 }
 
 double GetCurrentVWAP() {
-   int startBar = iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_D1, 0)); int limit = startBar;
-   double cumPV = 0, cumVol = 0; double high[], low[], close[]; long vol[];
-   ArraySetAsSeries(high, true); ArraySetAsSeries(low, true); ArraySetAsSeries(close, true); ArraySetAsSeries(vol, true);
-   if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, limit+1, high)<=0) return 0; if(CopyLow(_Symbol, PERIOD_CURRENT, 0, limit+1, low)<=0) return 0;
-   if(CopyClose(_Symbol, PERIOD_CURRENT, 0, limit+1, close)<=0) return 0; if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, limit+1, vol)<=0) return 0;
-   for(int i=limit; i>=0; i--) { double tp=(high[i]+low[i]+close[i])/3.0; double v=(double)vol[i]; cumPV+=tp*v; cumVol+=v; }
-   if(cumVol>0) return cumPV/cumVol; return 0;
-}
-void DrawChartMAs() {
-   if(ShowMA50) DrawSingleMA(handleMa50, 50, clrAqua, "MA50"); else ObjectsDeleteAll(0, "FLT_MA50_");
-   if(ShowMA100) DrawSingleMA(handleMa100, 100, clrOrange, "MA100"); else ObjectsDeleteAll(0, "FLT_MA100_");
-   if(ShowMA200) DrawSingleMA(handleMa200, 200, clrRed, "MA200"); else ObjectsDeleteAll(0, "FLT_MA200_");
-}
-void DrawSingleMA(int handle, int period, color col, string suffix) {
-   int drawBars = 300; double buff[]; if(CopyBuffer(handle, 0, 0, drawBars+1, buff)<=0) return; ArraySetAsSeries(buff, true);
-   for(int i=0; i<drawBars; i++) {
-      string n="FLT_"+suffix+"_"+IntegerToString(i); datetime t1=iTime(_Symbol, PERIOD_CURRENT, i+1); datetime t2=iTime(_Symbol, PERIOD_CURRENT, i);
-      double p1=buff[i+1]; double p2=buff[i]; if(p1==0||p2==0) continue;
-      if(ObjectFind(0, n)<0) ObjectCreate(0, n, OBJ_TREND, 0, t1, p1, t2, p2);
-      else { ObjectSetDouble(0, n, OBJPROP_PRICE, 0, p1); ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1); ObjectSetDouble(0, n, OBJPROP_PRICE, 1, p2); ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2); }
-      ObjectSetInteger(0, n, OBJPROP_COLOR, col); ObjectSetInteger(0, n, OBJPROP_WIDTH, (period==200)?2:1); ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false); ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
-   }
-}
-void DrawVWAP() {
-   int startBar=iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_D1, 0)); int limit=startBar;
-   double cumPV=0, cumVol=0, prevVwap=0; datetime prevTime=0;
-   double high[], low[], close[]; long vol[]; ArraySetAsSeries(high, true); ArraySetAsSeries(low, true); ArraySetAsSeries(close, true); ArraySetAsSeries(vol, true);
-   CopyHigh(_Symbol, PERIOD_CURRENT, 0, limit+1, high); CopyLow(_Symbol, PERIOD_CURRENT, 0, limit+1, low); CopyClose(_Symbol, PERIOD_CURRENT, 0, limit+1, close); CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, limit+1, vol);
+   int startBar = iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_D1, 0));
+   int limit = startBar;
+   double cumPV = 0, cumVol = 0;
+   double high[], low[], close[];
+   long vol[];
+
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   ArraySetAsSeries(close, true);
+   ArraySetAsSeries(vol, true);
+
+   if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, limit+1, high)<=0) return 0;
+   if(CopyLow(_Symbol, PERIOD_CURRENT, 0, limit+1, low)<=0) return 0;
+   if(CopyClose(_Symbol, PERIOD_CURRENT, 0, limit+1, close)<=0) return 0;
+   if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, limit+1, vol)<=0) return 0;
+
    for(int i=limit; i>=0; i--) {
-      double tp=(high[i]+low[i]+close[i])/3.0; double v=(double)vol[i]; cumPV+=tp*v; cumVol+=v; double vwap=(cumVol>0)?cumPV/cumVol:tp; datetime t=iTime(_Symbol, PERIOD_CURRENT, i);
-      if(i<limit) {
-         string n="FLT_VWAP_"+IntegerToString(i); if(ObjectFind(0, n)<0) ObjectCreate(0, n, OBJ_TREND, 0, prevTime, prevVwap, t, vwap);
-         else { ObjectSetDouble(0, n, OBJPROP_PRICE, 0, prevVwap); ObjectSetInteger(0, n, OBJPROP_TIME, 0, prevTime); ObjectSetDouble(0, n, OBJPROP_PRICE, 1, vwap); ObjectSetInteger(0, n, OBJPROP_TIME, 1, t); }
-         ObjectSetInteger(0, n, OBJPROP_COLOR, clrHotPink); ObjectSetInteger(0, n, OBJPROP_STYLE, STYLE_DASHDOT); ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false); ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
-      } prevVwap=vwap; prevTime=t;
+      double tp=(high[i]+low[i]+close[i])/3.0;
+      double v=(double)vol[i];
+      cumPV+=tp*v;
+      cumVol+=v;
+   }
+   if(cumVol>0) return cumPV/cumVol;
+   return 0;
+}
+
+void DrawChartMAs(bool fullRedraw) {
+   if(ShowMA50) DrawSingleMA(handleMa50, 50, clrAqua, "MA50", fullRedraw); else ObjectsDeleteAll(0, "FLT_MA50_");
+   if(ShowMA100) DrawSingleMA(handleMa100, 100, clrOrange, "MA100", fullRedraw); else ObjectsDeleteAll(0, "FLT_MA100_");
+   if(ShowMA200) DrawSingleMA(handleMa200, 200, clrRed, "MA200", fullRedraw); else ObjectsDeleteAll(0, "FLT_MA200_");
+}
+
+void DrawSingleMA(int handle, int period, color col, string suffix, bool fullRedraw) {
+   int drawBars = 300;
+   double buff[];
+
+   // If not full redraw, we only need a few bars to update the head.
+   // But we still need correct indexing.
+   // Simplest robust way: always get data, but only loop 0 if not fullRedraw.
+
+   if(CopyBuffer(handle, 0, 0, drawBars+1, buff)<=0) return;
+   ArraySetAsSeries(buff, true);
+
+   int limit = fullRedraw ? drawBars : 1;
+   // Note: We always update index 0 (current bar).
+   // If fullRedraw=false, we only loop i=0.
+
+   for(int i=0; i<limit; i++) {
+      string n="FLT_"+suffix+"_"+IntegerToString(i);
+      datetime t1=iTime(_Symbol, PERIOD_CURRENT, i+1);
+      datetime t2=iTime(_Symbol, PERIOD_CURRENT, i);
+      double p1=buff[i+1];
+      double p2=buff[i];
+
+      if(p1==0||p2==0) continue;
+
+      if(ObjectFind(0, n)<0)
+         ObjectCreate(0, n, OBJ_TREND, 0, t1, p1, t2, p2);
+      else {
+         ObjectSetDouble(0, n, OBJPROP_PRICE, 0, p1);
+         ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1);
+         ObjectSetDouble(0, n, OBJPROP_PRICE, 1, p2);
+         ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2);
+      }
+      ObjectSetInteger(0, n, OBJPROP_COLOR, col);
+      ObjectSetInteger(0, n, OBJPROP_WIDTH, (period==200)?2:1);
+      ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
+      ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
    }
 }
+
+void DrawVWAP(bool fullRedraw) {
+   int startBar=iBarShift(_Symbol, PERIOD_CURRENT, iTime(_Symbol, PERIOD_D1, 0));
+   int limit=startBar;
+
+   double cumPV=0, cumVol=0, prevVwap=0;
+   datetime prevTime=0;
+   double high[], low[], close[];
+   long vol[];
+
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   ArraySetAsSeries(close, true);
+   ArraySetAsSeries(vol, true);
+
+   if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, limit+1, high)<=0) return;
+   if(CopyLow(_Symbol, PERIOD_CURRENT, 0, limit+1, low)<=0) return;
+   if(CopyClose(_Symbol, PERIOD_CURRENT, 0, limit+1, close)<=0) return;
+   if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, limit+1, vol)<=0) return;
+
+   // VWAP Calculation involves iteration from start of day.
+   // We cannot easily skip calculation, but we can skip drawing objects for old bars.
+
+   for(int i=limit; i>=0; i--) {
+      double tp=(high[i]+low[i]+close[i])/3.0;
+      double v=(double)vol[i];
+      cumPV+=tp*v;
+      cumVol+=v;
+      double vwap=(cumVol>0)?cumPV/cumVol:tp;
+      datetime t=iTime(_Symbol, PERIOD_CURRENT, i);
+
+      // Drawing
+      if(i<limit) {
+         // Optimization: Only draw if fullRedraw or if i==0 (current bar)
+         if(fullRedraw || i==0) {
+             string n="FLT_VWAP_"+IntegerToString(i);
+             if(ObjectFind(0, n)<0)
+                 ObjectCreate(0, n, OBJ_TREND, 0, prevTime, prevVwap, t, vwap);
+             else {
+                 ObjectSetDouble(0, n, OBJPROP_PRICE, 0, prevVwap);
+                 ObjectSetInteger(0, n, OBJPROP_TIME, 0, prevTime);
+                 ObjectSetDouble(0, n, OBJPROP_PRICE, 1, vwap);
+                 ObjectSetInteger(0, n, OBJPROP_TIME, 1, t);
+             }
+             ObjectSetInteger(0, n, OBJPROP_COLOR, clrHotPink);
+             ObjectSetInteger(0, n, OBJPROP_STYLE, STYLE_DASHDOT);
+             ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
+             ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
+         }
+      }
+      prevVwap=vwap;
+      prevTime=t;
+   }
+}
+
 void DrawDailyMA() {
-   double ma[]; if(CopyBuffer(handleMaDaily, 0, 0, 1, ma)<=0) return; double p=ma[0];
-   datetime t1=iTime(_Symbol, PERIOD_D1, 0); datetime t2=t1+PeriodSeconds(PERIOD_D1); string n="FLT_Daily200";
-   if(ObjectFind(0, n)<0) ObjectCreate(0, n, OBJ_TREND, 0, t1, p, t2, p); else { ObjectSetDouble(0, n, OBJPROP_PRICE, 0, p); ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1); ObjectSetDouble(0, n, OBJPROP_PRICE, 1, p); ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2); }
-   ObjectSetInteger(0, n, OBJPROP_COLOR, clrYellow); ObjectSetInteger(0, n, OBJPROP_WIDTH, 2); ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false); ObjectSetString(0, n, OBJPROP_TEXT, " Daily 200 SMA");
+   double ma[];
+   if(CopyBuffer(handleMaDaily, 0, 0, 1, ma)<=0) return;
+   double p=ma[0];
+   datetime t1=iTime(_Symbol, PERIOD_D1, 0);
+   datetime t2=t1+PeriodSeconds(PERIOD_D1);
+   string n="FLT_Daily200";
+
+   if(ObjectFind(0, n)<0)
+      ObjectCreate(0, n, OBJ_TREND, 0, t1, p, t2, p);
+   else {
+      ObjectSetDouble(0, n, OBJPROP_PRICE, 0, p);
+      ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1);
+      ObjectSetDouble(0, n, OBJPROP_PRICE, 1, p);
+      ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2);
+   }
+   ObjectSetInteger(0, n, OBJPROP_COLOR, clrYellow);
+   ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
+   ObjectSetString(0, n, OBJPROP_TEXT, " Daily 200 SMA");
 }
+
 void DrawPivots() {
-   ObjectsDeleteAll(0, "DGT"); double h=iHigh(_Symbol, PERIOD_D1, 1); double l=iLow(_Symbol, PERIOD_D1, 1); double c=iClose(_Symbol, PERIOD_D1, 1);
-   double pp=(h+l+c)/3.0; double r1=2*pp-l; double s1=2*pp-h; double r2=pp+(h-l); double s2=pp-(h-l); double r3=h+2*(pp-l); double s3=l-2*(h-pp);
-   CreateLine("PP", pp, ColorPP, 2); CreateLine("R1", r1, ColorR, 1); CreateLine("S1", s1, ColorS, 1);
-   CreateLine("R2", r2, ColorR, 1); CreateLine("S2", s2, ColorS, 1); CreateLine("R3", r3, ColorR, 1); CreateLine("S3", s3, ColorS, 1); ChartRedraw(0);
+   ObjectsDeleteAll(0, "DGT");
+   double h=iHigh(_Symbol, PERIOD_D1, 1);
+   double l=iLow(_Symbol, PERIOD_D1, 1);
+   double c=iClose(_Symbol, PERIOD_D1, 1);
+
+   double pp=(h+l+c)/3.0;
+   double r1=2*pp-l;
+   double s1=2*pp-h;
+   double r2=pp+(h-l);
+   double s2=pp-(h-l);
+   double r3=h+2*(pp-l);
+   double s3=l-2*(h-pp);
+
+   CreateLine("PP", pp, ColorPP, 2);
+   CreateLine("R1", r1, ColorR, 1);
+   CreateLine("S1", s1, ColorS, 1);
+   CreateLine("R2", r2, ColorR, 1);
+   CreateLine("S2", s2, ColorS, 1);
+   CreateLine("R3", r3, ColorR, 1);
+   CreateLine("S3", s3, ColorS, 1);
+   ChartRedraw(0);
 }
+
 void CreateLine(string name, double price, color col, int width) {
-   datetime t1=iTime(_Symbol, PERIOD_D1, 0); datetime t2=t1+PeriodSeconds(PERIOD_D1); string n="DGT "+name;
-   if(ObjectFind(0, n)<0) ObjectCreate(0, n, OBJ_TREND, 0, t1, price, t2, price); else { ObjectSetDouble(0, n, OBJPROP_PRICE, 0, price); ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1); ObjectSetDouble(0, n, OBJPROP_PRICE, 1, price); ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2); }
-   ObjectSetInteger(0, n, OBJPROP_COLOR, col); ObjectSetInteger(0, n, OBJPROP_WIDTH, width); ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false); ObjectSetString(0, n, OBJPROP_TEXT, "  "+name); ObjectSetInteger(0, n, OBJPROP_FONTSIZE, 8); ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
+   datetime t1=iTime(_Symbol, PERIOD_D1, 0);
+   datetime t2=t1+PeriodSeconds(PERIOD_D1);
+   string n="DGT "+name;
+
+   if(ObjectFind(0, n)<0)
+      ObjectCreate(0, n, OBJ_TREND, 0, t1, price, t2, price);
+   else {
+      ObjectSetDouble(0, n, OBJPROP_PRICE, 0, price);
+      ObjectSetInteger(0, n, OBJPROP_TIME, 0, t1);
+      ObjectSetDouble(0, n, OBJPROP_PRICE, 1, price);
+      ObjectSetInteger(0, n, OBJPROP_TIME, 1, t2);
+   }
+   ObjectSetInteger(0, n, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, n, OBJPROP_WIDTH, width);
+   ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
+   ObjectSetString(0, n, OBJPROP_TEXT, "  "+name);
+   ObjectSetInteger(0, n, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, n, OBJPROP_SELECTABLE, false);
 }
+
 void SetupChart() {
-   ChartSetInteger(0, CHART_MODE, CHART_CANDLES); ChartSetInteger(0, CHART_SHOW_GRID, false); ChartSetInteger(0, CHART_SHOW_PERIOD_SEP, false); ChartSetInteger(0, CHART_COLOR_BACKGROUND, ClrBack); ChartSetInteger(0, CHART_COLOR_FOREGROUND, clrWhite); ChartSetInteger(0, CHART_COLOR_CANDLE_BEAR, ClrCandleDn); ChartSetInteger(0, CHART_COLOR_CHART_DOWN, ClrCandleDn); ChartSetInteger(0, CHART_COLOR_CANDLE_BULL, ClrCandleUp); ChartSetInteger(0, CHART_COLOR_CHART_UP, ClrCandleUp); ChartRedraw(0);
+   ChartSetInteger(0, CHART_MODE, CHART_CANDLES);
+   ChartSetInteger(0, CHART_SHOW_GRID, false);
+   ChartSetInteger(0, CHART_SHOW_PERIOD_SEP, false);
+   ChartSetInteger(0, CHART_COLOR_BACKGROUND, ClrBack);
+   ChartSetInteger(0, CHART_COLOR_FOREGROUND, clrWhite);
+   ChartSetInteger(0, CHART_COLOR_CANDLE_BEAR, ClrCandleDn);
+   ChartSetInteger(0, CHART_COLOR_CHART_DOWN, ClrCandleDn);
+   ChartSetInteger(0, CHART_COLOR_CANDLE_BULL, ClrCandleUp);
+   ChartSetInteger(0, CHART_COLOR_CHART_UP, ClrCandleUp);
+   ChartRedraw(0);
 }
